@@ -12,9 +12,13 @@
     xui-sub-fa refresh          rebuild after a panel update (xui-sub-fa.path runs it by itself
                                 when the x-ui binary changes); does nothing while off
     xui-sub-fa off              back to the untouched page
+    xui-sub-fa detect [--shell] where the panel keeps its data and which binary it runs
 
-Environment: XUI_BIN (default /usr/local/x-ui/x-ui), XUI_DB (default /etc/x-ui/x-ui.db). A panel on
-PostgreSQL (XUI_DB_TYPE=postgres, XUI_DB_DSN in /etc/default/x-ui) is found by itself; needs psql.
+The database and the binary are found the way the panel itself sees them: the environment of
+the running x-ui process (XUI_DB_TYPE, XUI_DB_DSN, XUI_DB_FOLDER), else the x-ui service's
+Environment= and EnvironmentFile= (/etc/default/x-ui), else SQLite in /etc/x-ui. PostgreSQL is
+reached with psql. `xui-sub-fa detect` shows what was found; XUI_BIN, XUI_DB, XUI_DB_TYPE and
+XUI_DB_DSN in this tool's own environment override it.
 
 The subscription page's language is a cookie in the user's browser (subLang), separate from the
 panel's, and defaults to the phone's language - an English phone gets English. 3x-ui can render
@@ -29,10 +33,9 @@ back if the template is not served. No restart: 3x-ui reads the setting on every
 """
 import json, os, re, shutil, sqlite3, ssl, subprocess, sys, urllib.error, urllib.parse, urllib.request
 
-VERSION = "1.2.0"
-XUI = os.environ.get("XUI_BIN", "/usr/local/x-ui/x-ui")
-DB = os.environ.get("XUI_DB", "/etc/x-ui/x-ui.db")
-ENV_FILE = "/etc/default/x-ui"                 # where the panel's service reads XUI_DB_TYPE / XUI_DB_DSN
+VERSION = "1.3.0"
+SERVICE = "x-ui"
+DB_KEYS = ("XUI_DB_TYPE", "XUI_DB_DSN", "XUI_DB_FOLDER")
 DIR = "/usr/local/share/xui-sub-fa"
 CONF = "/etc/xui-sub-fa.json"
 MARK = 'id="xo-stamp"'                  # html/template drops JS comments, not this
@@ -133,24 +136,91 @@ def save_conf(c):
         json.dump(c, f, indent=2)
 
 
-def panel_env():
-    """The database the panel itself uses: its environment file, overridden by ours."""
+def parse_env(text, sep="\n"):
     env = {}
-    try:
-        for line in open(ENV_FILE):
-            m = re.match(r"\s*(?:export\s+)?(XUI_DB_TYPE|XUI_DB_DSN)\s*=\s*(.*?)\s*$", line)
-            if m:
-                env[m.group(1)] = m.group(2).strip("'\"")
-    except OSError:
-        pass
-    env.update({k: os.environ[k] for k in ("XUI_DB_TYPE", "XUI_DB_DSN") if os.environ.get(k)})
+    for line in text.split(sep):
+        m = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$", line)
+        if m:
+            env[m.group(1)] = m.group(2).strip("'\"")
     return env
+
+
+def running_pid():
+    """x-ui's main process: from systemd, else any process whose binary is called x-ui."""
+    r = subprocess.run(["systemctl", "show", "-p", "MainPID", "--value", SERVICE], capture_output=True, text=True)
+    pid = (r.stdout or "").strip()
+    if pid.isdigit() and pid != "0":
+        return pid
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            if os.path.basename(os.readlink("/proc/%s/exe" % pid)) == "x-ui":
+                return pid
+        except OSError:
+            pass
+    return None
+
+
+def service_env():
+    """What systemd would hand x-ui on its next start: Environment= and EnvironmentFile=."""
+    env = {}
+    r = subprocess.run(["systemctl", "show", "-p", "EnvironmentFiles", "-p", "Environment", SERVICE],
+                       capture_output=True, text=True)
+    files = []
+    for line in (r.stdout or "").splitlines():
+        if line.startswith("EnvironmentFiles="):
+            files += [f.split(" ")[0].lstrip("-") for f in line[17:].split("\n") if f]
+    for f in files + ["/etc/default/x-ui"]:
+        try:
+            env.update({k: v for k, v in parse_env(open(f).read()).items() if k in DB_KEYS and k not in env})
+        except OSError:
+            pass
+    for line in (r.stdout or "").splitlines():                # Environment= wins over the files
+        if line.startswith("Environment="):
+            for item in re.findall(r'(?:"[^"]*"|\S)+', line[12:]):
+                env.update({k: v for k, v in parse_env(item.strip('"')).items() if k in DB_KEYS})
+    return env
+
+
+_FOUND = None
+
+
+def detect():
+    """Where this panel keeps its data, and which binary it runs - as the panel sees it."""
+    global _FOUND
+    if _FOUND:
+        return _FOUND
+    env, source, pid = {}, "default", running_pid()
+    xui = "/usr/local/x-ui/x-ui"
+    if pid:
+        try:
+            raw = open("/proc/%s/environ" % pid, "rb").read().decode("utf-8", "replace")
+            env = {k: v for k, v in parse_env(raw, "\0").items() if k in DB_KEYS}
+            source = "running x-ui (pid %s)" % pid
+            exe = os.readlink("/proc/%s/exe" % pid).replace(" (deleted)", "")
+            xui = exe if os.path.isfile(exe) else xui
+            if os.stat("/proc/%s/root/" % pid).st_ino != os.stat("/").st_ino:
+                die("x-ui runs in a container (Docker?) - install inside the container instead")
+        except OSError:
+            pid = None
+    if not pid:
+        env = service_env()
+        source = "x-ui service settings" if env else "default"
+    env.update({k: os.environ[k] for k in DB_KEYS if os.environ.get(k)})   # ours override
+    kind = "postgres" if env.get("XUI_DB_TYPE", "").strip().lower() in ("postgres", "postgresql", "pg") else "sqlite"
+    path = os.environ.get("XUI_DB") or "%s/x-ui.db" % (env.get("XUI_DB_FOLDER") or "/etc/x-ui").rstrip("/")
+    _FOUND = {"kind": kind, "dsn": env.get("XUI_DB_DSN", "").strip(), "path": path, "source": source,
+              "bin": os.environ.get("XUI_BIN") or xui, "running": bool(pid)}
+    return _FOUND
+
+
+def xui_bin():
+    return detect()["bin"]
 
 
 class Sqlite:
     def __init__(self, path):
         if not os.path.isfile(path):
-            die("no 3x-ui database at %s (set XUI_DB)" % path)
+            die("no 3x-ui database at %s (set XUI_DB, or XUI_DB_TYPE/XUI_DB_DSN)" % path)
         self.c = sqlite3.connect(path)
 
     def rows(self, sql):
@@ -214,12 +284,18 @@ class Postgres:
 
 
 def db():
-    env = panel_env()
-    if env.get("XUI_DB_TYPE", "sqlite").lower() in ("postgres", "postgresql", "pg"):
-        if not env.get("XUI_DB_DSN"):
-            die("XUI_DB_TYPE=postgres but no XUI_DB_DSN in %s" % ENV_FILE)
-        return Postgres(env["XUI_DB_DSN"])
-    return Sqlite(DB)
+    d = detect()
+    if d["kind"] == "postgres":
+        if not d["dsn"]:
+            die("x-ui is set to PostgreSQL but has no XUI_DB_DSN")
+        return Postgres(d["dsn"])
+    return Sqlite(d["path"])
+
+
+def describe():
+    d = detect()
+    where = re.sub(r"//[^@/]*@", "//", d["dsn"]) if d["kind"] == "postgres" else d["path"]   # no password
+    return "%s %s (from %s)" % (d["kind"], where, d["source"])
 
 
 def setting(c, key, default=""):
@@ -232,9 +308,10 @@ def put(c, key, value):
 
 def original():
     """The panel's subscription page as built into this x-ui binary (Go embeds files as they are)."""
-    if not os.path.isfile(XUI):
-        die("no x-ui binary at %s (set XUI_BIN)" % XUI)
-    b = open(XUI, "rb").read()
+    xui = xui_bin()
+    if not os.path.isfile(xui):
+        die("no x-ui binary at %s (set XUI_BIN)" % xui)
+    b = open(xui, "rb").read()
     if b"subThemeDir" not in b:
         die("this 3x-ui has no \"Sub Theme Directory\" setting - update the panel first")
     for m in re.finditer(rb"<!doctype html>", b, re.I):
@@ -242,7 +319,7 @@ def original():
         page = b[m.start():end + 7]
         if end > 0 and len(page) < 50000 and b"/subpage-" in page:
             return page.decode("utf-8")
-    die("the subscription page was not found in %s - this needs 3x-ui 3.x" % XUI)
+    die("the subscription page was not found in %s - this needs 3x-ui 3.x" % xui)
 
 
 def asset(page):
@@ -336,12 +413,13 @@ def status(as_json=False, sid=None):
         current = asset(open(DIR + "/index.html", encoding="utf-8").read())
     except OSError:
         current = ""
-    st = {"version": VERSION, "theme_dir": setting(c, "subThemeDir"), "on": ours(c),
+    st = {"version": VERSION, "database": describe(), "theme_dir": setting(c, "subThemeDir"), "on": ours(c),
           "serving": "persian" if body and MARK in body else ("panel" if body else "unknown"),
           "current": bool(current) and current == asset(original()), "options": conf(), "error": err}
     if as_json:
         print(json.dumps(st))
         return 0
+    print("database  : %s" % st["database"])
     print("theme dir : %s" % (st["theme_dir"] or "(empty - the panel's own page)"))
     print("serving   : %s%s" % (st["serving"], " (%s)" % err if err else ""))
     if st["on"]:
@@ -405,6 +483,18 @@ def off():
     return 0
 
 
+def show_detect(shell=False):
+    d = detect()
+    if shell:                                                 # for install.sh
+        print("XUI_KIND=%s" % d["kind"])
+        print("XUI_BIN_FOUND=%s" % d["bin"])
+        return 0
+    print("database : %s" % describe())
+    print("binary   : %s" % d["bin"])
+    print("running  : %s" % ("yes" if d["running"] else "no"))
+    return 0
+
+
 def opt(args, name):
     if name in args:
         i = args.index(name)
@@ -425,7 +515,8 @@ def main(a):
         die("run as root")
     if a[0] == "on":
         return on(a[1:])
-    cmds = {"status": lambda: status("--json" in a, opt(a, "--sub")), "refresh": refresh, "off": off}
+    cmds = {"status": lambda: status("--json" in a, opt(a, "--sub")), "refresh": refresh, "off": off,
+            "detect": lambda: show_detect("--shell" in a)}
     if a[0] not in cmds:
         die("unknown command: %s (on | status | refresh | off)" % a[0])
     return cmds[a[0]]()

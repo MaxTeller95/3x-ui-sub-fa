@@ -41,16 +41,19 @@ xui-sub-fa status --sub LINK   # امتحان با لینک اشتراک یک ک
 xui-sub-fa on [گزینه‌ها]    # روشن کردن یا عوض کردن گزینه‌ها (--no-jalali --no-stamp --always و برعکس‌شان --jalali --stamp --once)
 xui-sub-fa refresh         # ساختن دوباره (بعد از آپدیت پنل خودکار انجام می‌شود)
 xui-sub-fa off             # برگشت به صفحه‌ی خود پنل
+xui-sub-fa detect          # دیتابیس و باینری پنل که پیدا شده
 ```
 
 ## پیش‌نیاز
 
 - 3x-ui نسخه‌ی 3 که تنظیم **Sub Theme Directory** دارد (تنظیمات ← اشتراک). نصب‌کننده خودش چک می‌کند.
 - سرویس اشتراک در پنل روشن باشد. `python3` اگر نباشد نصب می‌شود.
-- دیتابیس SQLite یا **PostgreSQL** (پنلی که با `XUI_DB_TYPE=postgres` در `/etc/default/x-ui` کار می‌کند خودش
-  شناخته می‌شود و `psql` اگر نباشد نصب می‌شود).
-- نصب معمولی پنل (`/usr/local/x-ui/x-ui` و `/etc/x-ui/x-ui.db`). اگر جای دیگری است:
-  `XUI_BIN=/path/x-ui XUI_DB=/path/x-ui.db bash <(curl ...)`
+- دیتابیس **خودکار تشخیص داده می‌شود**، همان‌طور که خود پنل می‌بیند: اول از محیط پروسه‌ی x-ui در حال اجرا،
+  بعد از تنظیمات سرویس x-ui (`Environment=` و `/etc/default/x-ui`)، و در آخر SQLite پیش‌فرض. پنلی که با
+  **PostgreSQL** کار می‌کند (`XUI_DB_TYPE=postgres`) هم پشتیبانی می‌شود و `psql` اگر نباشد نصب می‌شود.
+  مسیر باینری x-ui هم از پروسه‌ی در حال اجرا خوانده می‌شود. `xui-sub-fa detect` نشان می‌دهد چه پیدا شده.
+- اگر تشخیص خودکار اشتباه کرد، با این متغیرها دستی بدهید: `XUI_BIN`، `XUI_DB`، `XUI_DB_TYPE`، `XUI_DB_DSN`.
+- x-ui داخل Docker پشتیبانی نمی‌شود (داخل خود کانتینر نصب کنید).
 
 ## چطور کار می‌کند
 
@@ -80,7 +83,8 @@ own page inside the x-ui binary, so it looks exactly the same; added are only a 
 cookie (once per browser, or `--always`), Jalali dates while Persian (`--no-jalali` to keep the
 panel's calendar) and the stamp (`--no-stamp`). Apps still get only the configs. No panel restart;
 `xui-sub-fa.path` rebuilds the template when the x-ui binary changes, since the page's asset names
-change per release. Needs 3x-ui 3.x with the "Sub Theme Directory" setting.
+change per release. The database (SQLite or PostgreSQL) and the binary are detected from the running
+x-ui process, then its service settings; `xui-sub-fa detect` shows them. Needs 3x-ui 3.x with the "Sub Theme Directory" setting.
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/MaxTeller95/3x-ui-sub-fa/main/install.sh)
