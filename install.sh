@@ -50,7 +50,20 @@ fi
 XUI_BIN=${XUI_BIN:-/usr/local/x-ui/x-ui}
 XUI_DB=${XUI_DB:-/etc/x-ui/x-ui.db}
 [ -f "$XUI_BIN" ] || { red "x-ui در $XUI_BIN پیدا نشد (اگر جای دیگری است XUI_BIN را تنظیم کنید)"; exit 1; }
-[ -f "$XUI_DB" ]  || { red "دیتابیس در $XUI_DB پیدا نشد (XUI_DB را تنظیم کنید)"; exit 1; }
+DB_TYPE=$(sed -n 's/^[[:space:]]*\(export[[:space:]]\+\)\?XUI_DB_TYPE[[:space:]]*=[[:space:]]*["'"'"']\?\([a-zA-Z]*\).*/\2/p' /etc/default/x-ui 2>/dev/null | tail -1)
+DB_TYPE=${XUI_DB_TYPE:-${DB_TYPE:-sqlite}}
+case "$DB_TYPE" in
+  postgres|postgresql|pg)
+    inf "پنل از PostgreSQL استفاده می‌کند"
+    if ! command -v psql >/dev/null; then
+      inf "نصب psql"
+      if command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y -qq postgresql-client >/dev/null
+      elif command -v dnf >/dev/null; then dnf install -y -q postgresql
+      elif command -v yum >/dev/null; then yum install -y -q postgresql
+      else red "psql را دستی نصب کنید"; exit 1; fi
+    fi ;;
+  *) [ -f "$XUI_DB" ] || { red "دیتابیس در $XUI_DB پیدا نشد (XUI_DB را تنظیم کنید)"; exit 1; } ;;
+esac
 grep -qa subThemeDir "$XUI_BIN" || { red "این نسخه‌ی 3x-ui تنظیم Sub Theme Directory ندارد؛ اول پنل را آپدیت کنید"; exit 1; }
 
 if ! command -v python3 >/dev/null || ! python3 -c 'import sqlite3' 2>/dev/null; then

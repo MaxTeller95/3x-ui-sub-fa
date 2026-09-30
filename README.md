@@ -47,6 +47,8 @@ xui-sub-fa off             # برگشت به صفحه‌ی خود پنل
 
 - 3x-ui نسخه‌ی 3 که تنظیم **Sub Theme Directory** دارد (تنظیمات ← اشتراک). نصب‌کننده خودش چک می‌کند.
 - سرویس اشتراک در پنل روشن باشد. `python3` اگر نباشد نصب می‌شود.
+- دیتابیس SQLite یا **PostgreSQL** (پنلی که با `XUI_DB_TYPE=postgres` در `/etc/default/x-ui` کار می‌کند خودش
+  شناخته می‌شود و `psql` اگر نباشد نصب می‌شود).
 - نصب معمولی پنل (`/usr/local/x-ui/x-ui` و `/etc/x-ui/x-ui.db`). اگر جای دیگری است:
   `XUI_BIN=/path/x-ui XUI_DB=/path/x-ui.db bash <(curl ...)`
 

@@ -13,7 +13,8 @@
                                 when the x-ui binary changes); does nothing while off
     xui-sub-fa off              back to the untouched page
 
-Environment: XUI_BIN (default /usr/local/x-ui/x-ui), XUI_DB (default /etc/x-ui/x-ui.db).
+Environment: XUI_BIN (default /usr/local/x-ui/x-ui), XUI_DB (default /etc/x-ui/x-ui.db). A panel on
+PostgreSQL (XUI_DB_TYPE=postgres, XUI_DB_DSN in /etc/default/x-ui) is found by itself; needs psql.
 
 The subscription page's language is a cookie in the user's browser (subLang), separate from the
 panel's, and defaults to the phone's language - an English phone gets English. 3x-ui can render
@@ -26,11 +27,12 @@ The page's script and style file names change with every panel release, hence th
 update. `on` renders a real subscription through the panel afterwards and puts the old setting
 back if the template is not served. No restart: 3x-ui reads the setting on every request.
 """
-import json, os, re, sqlite3, ssl, subprocess, sys, urllib.error, urllib.request
+import json, os, re, shutil, sqlite3, ssl, subprocess, sys, urllib.error, urllib.parse, urllib.request
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 XUI = os.environ.get("XUI_BIN", "/usr/local/x-ui/x-ui")
 DB = os.environ.get("XUI_DB", "/etc/x-ui/x-ui.db")
+ENV_FILE = "/etc/default/x-ui"                 # where the panel's service reads XUI_DB_TYPE / XUI_DB_DSN
 DIR = "/usr/local/share/xui-sub-fa"
 CONF = "/etc/xui-sub-fa.json"
 MARK = 'id="xo-stamp"'                  # html/template drops JS comments, not this
@@ -131,21 +133,101 @@ def save_conf(c):
         json.dump(c, f, indent=2)
 
 
+def panel_env():
+    """The database the panel itself uses: its environment file, overridden by ours."""
+    env = {}
+    try:
+        for line in open(ENV_FILE):
+            m = re.match(r"\s*(?:export\s+)?(XUI_DB_TYPE|XUI_DB_DSN)\s*=\s*(.*?)\s*$", line)
+            if m:
+                env[m.group(1)] = m.group(2).strip("'\"")
+    except OSError:
+        pass
+    env.update({k: os.environ[k] for k in ("XUI_DB_TYPE", "XUI_DB_DSN") if os.environ.get(k)})
+    return env
+
+
+class Sqlite:
+    def __init__(self, path):
+        if not os.path.isfile(path):
+            die("no 3x-ui database at %s (set XUI_DB)" % path)
+        self.c = sqlite3.connect(path)
+
+    def rows(self, sql):
+        return self.c.execute(sql).fetchall()
+
+    def tables(self):
+        return {r[0] for r in self.rows("select name from sqlite_master where type='table'")}
+
+    def columns(self, table):
+        return {r[1] for r in self.rows("pragma table_info(%s)" % table)}
+
+    def get(self, key, default):
+        r = self.c.execute("select value from settings where key=?", (key,)).fetchone()
+        return r[0] if r else default
+
+    def put(self, key, value):
+        if self.c.execute("update settings set value=? where key=?", (value, key)).rowcount == 0:
+            self.c.execute("insert into settings (key, value) values (?, ?)", (key, value))
+        self.c.commit()
+
+
+class Postgres:
+    """3x-ui 3.x can keep its data in PostgreSQL (XUI_DB_TYPE=postgres). Talked to with psql;
+    the connection goes through libpq's environment so the password is not on a command line."""
+    def __init__(self, dsn):
+        if not shutil.which("psql"):
+            die("the panel uses PostgreSQL and psql is missing (apt install postgresql-client)")
+        u = urllib.parse.urlsplit(dsn)
+        q = dict(urllib.parse.parse_qsl(u.query))
+        self.env = dict(os.environ, PGHOST=u.hostname or "127.0.0.1", PGPORT=str(u.port or 5432),
+                        PGUSER=urllib.parse.unquote(u.username or ""), PGPASSWORD=urllib.parse.unquote(u.password or ""),
+                        PGDATABASE=u.path.lstrip("/"), PGSSLMODE=q.get("sslmode", "prefer"), PGCONNECT_TIMEOUT="10")
+        self.rows("select 1")
+
+    @staticmethod
+    def lit(v):
+        return "'" + str(v).replace("'", "''") + "'"
+
+    def rows(self, sql):
+        r = subprocess.run(["psql", "-X", "-q", "-At", "-F", "\x1f", "-v", "ON_ERROR_STOP=1", "-c", sql],
+                           capture_output=True, text=True, env=self.env, timeout=30)
+        if r.returncode:
+            die("PostgreSQL: %s" % (r.stderr.strip().splitlines() or ["error"])[-1])
+        return [tuple(l.split("\x1f")) for l in r.stdout.splitlines() if l]
+
+    def tables(self):
+        return {r[0] for r in self.rows("select table_name from information_schema.tables where table_schema = current_schema()")}
+
+    def columns(self, table):
+        return {r[0] for r in self.rows("select column_name from information_schema.columns where table_schema = "
+                                         "current_schema() and table_name = %s" % self.lit(table))}
+
+    def get(self, key, default):
+        r = self.rows("select value from settings where key = %s limit 1" % self.lit(key))
+        return r[0][0] if r else default
+
+    def put(self, key, value):
+        k, v = self.lit(key), self.lit(value)
+        self.rows("with u as (update settings set value = %s where key = %s returning 1) "
+                  "insert into settings (key, value) select %s, %s where not exists (select 1 from u)" % (v, k, k, v))
+
+
 def db():
-    if not os.path.isfile(DB):
-        die("no 3x-ui database at %s (set XUI_DB)" % DB)
-    return sqlite3.connect(DB)
+    env = panel_env()
+    if env.get("XUI_DB_TYPE", "sqlite").lower() in ("postgres", "postgresql", "pg"):
+        if not env.get("XUI_DB_DSN"):
+            die("XUI_DB_TYPE=postgres but no XUI_DB_DSN in %s" % ENV_FILE)
+        return Postgres(env["XUI_DB_DSN"])
+    return Sqlite(DB)
 
 
 def setting(c, key, default=""):
-    r = c.execute("select value from settings where key=?", (key,)).fetchone()
-    return r[0] if r else default
+    return c.get(key, default)
 
 
 def put(c, key, value):
-    if c.execute("update settings set value=? where key=?", (value, key)).rowcount == 0:
-        c.execute("insert into settings (key, value) values (?, ?)", (key, value))
-    c.commit()
+    c.put(key, value)
 
 
 def original():
@@ -191,15 +273,15 @@ def build(c, cf):
 def sub_ids(c):
     """Subscription ids the panel knows, wherever this version keeps them."""
     found = []
-    tables = {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
+    tables = c.tables()
     for table in ("clients", "client_traffics"):
         if table in tables:
-            cols = {r[1] for r in c.execute("pragma table_info(%s)" % table)}
+            cols = c.columns(table)
             for col in ("sub_id", "subId"):
                 if col in cols:
-                    found += [r[0] for r in c.execute("select %s from %s where coalesce(%s, '') != '' limit 5" % (col, table, col))]
-    if "inbounds" in tables:                                  # clients inside each inbound's settings
-        for (s,) in c.execute("select settings from inbounds"):
+                    found += [r[0] for r in c.rows("select %s from %s where coalesce(%s, '') <> '' limit 5" % (col, table, col))]
+    if not found and "inbounds" in tables:                    # clients inside each inbound's settings
+        for (s,) in c.rows("select settings from inbounds"):
             try:
                 found += [x.get("subId") for x in json.loads(s or "{}").get("clients", []) if x.get("subId")]
             except (ValueError, AttributeError):
