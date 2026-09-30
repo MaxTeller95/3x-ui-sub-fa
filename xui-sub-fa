@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""xui-sub-fa - 3x-ui's own subscription page, in Persian, with a stamp on dead subscriptions.
+
+    xui-sub-fa on [options]     serve the panel's page in Persian
+        --no-jalali               keep the panel's calendar (default: Jalali while the page is Persian)
+        --no-stamp                no stamp on expired / used-up / disabled subscriptions
+        --always                  Persian on every visit (default: once per browser, after which the
+                                  page's own language button is respected)
+    xui-sub-fa status [--json]  which page the users see, and whether it matches the installed panel
+    xui-sub-fa refresh          rebuild after a panel update (xui-sub-fa.path runs it by itself
+                                when the x-ui binary changes); does nothing while off
+    xui-sub-fa off              back to the untouched page
+
+Environment: XUI_BIN (default /usr/local/x-ui/x-ui), XUI_DB (default /etc/x-ui/x-ui.db).
+
+The subscription page's language is a cookie in the user's browser (subLang), separate from the
+panel's, and defaults to the phone's language - an English phone gets English. 3x-ui can render
+the page from a template instead ("Sub Theme Directory"): this builds that template out of the
+panel's own page, taken from the x-ui binary, so it looks exactly the same. Added are only the
+Persian cookie, Jalali dates and the stamp. The panel's own language is untouched, and so are the
+apps: they never get the page, only the configs.
+
+The page's script and style file names change with every panel release, hence the rebuild on
+update. `on` renders a real subscription through the panel afterwards and puts the old setting
+back if the template is not served. No restart: 3x-ui reads the setting on every request.
+"""
+import json, os, re, sqlite3, ssl, subprocess, sys, urllib.request
+
+VERSION = "1.0.0"
+XUI = os.environ.get("XUI_BIN", "/usr/local/x-ui/x-ui")
+DB = os.environ.get("XUI_DB", "/etc/x-ui/x-ui.db")
+DIR = "/usr/local/share/xui-sub-fa"
+CONF = "/etc/xui-sub-fa.json"
+MARK = 'id="xo-stamp"'                  # html/template drops JS comments, not this
+DEFAULTS = {"jalali": True, "stamp": True, "always": False}
+
+# First thing in <head>: pick Persian before the page reads its cookie.
+BOOT = """<script>
+(function () {
+  var always = %s;
+  var has = function (n) { return document.cookie.split("; ").some(function (c) { return c.indexOf(n + "=") === 0; }); };
+  if (always || !has("xoFa")) {
+    var exp = new Date(Date.now() + 365 * 864e5).toUTCString();
+    document.cookie = "subLang=fa-IR;expires=" + exp + ";path=/";
+    document.cookie = "xoFa=1;expires=" + exp + ";path=/";
+  }
+})();
+</script>
+"""
+
+# In place of the data the panel would inject.
+DATA = """<script>
+window.X_UI_BASE_PATH = "%s";
+window.__SUB_PAGE_DATA__ = {{ . }};
+(function () {
+  var m = document.cookie.match(/(?:^|; )subLang=([^;]*)/);
+  if (%s && m && /^fa/.test(decodeURIComponent(m[1]))) window.__SUB_PAGE_DATA__.datepicker = "jalali";
+})();
+</script>
+"""
+
+STYLE = """<style>
+.xo-stamp { position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+  pointer-events: none; z-index: 2000; overflow: hidden; }
+.xo-stamp.show { display: flex; }
+.xo-stamp div { color: #ff3b4e; border: 6px double #ff3b4e; border-radius: 18px; padding: 12px 26px 8px;
+  text-align: center; white-space: nowrap; font: 900 clamp(1.7rem, 9vw, 3.8rem)/1.35 Vazirmatn, "Segoe UI", Tahoma, sans-serif;
+  transform: rotate(-16deg); opacity: .92; background: rgba(40, 6, 12, .62);
+  backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
+  box-shadow: 0 0 0 3px rgba(255, 59, 78, .25) inset, 0 0 40px rgba(255, 59, 78, .25);
+  text-shadow: 0 0 12px rgba(255, 59, 78, .35); animation: xo-slam .45s cubic-bezier(.2, 1.6, .4, 1) both;
+  -webkit-mask-image: repeating-linear-gradient(35deg, #000 0 7px, rgba(0, 0, 0, .75) 7px 9px);
+          mask-image: repeating-linear-gradient(35deg, #000 0 7px, rgba(0, 0, 0, .75) 7px 9px); }
+.xo-stamp small { display: block; white-space: normal; font-size: .34em; font-weight: 700; margin-top: 2px; }
+@keyframes xo-slam { from { transform: rotate(-16deg) scale(2.2); opacity: 0; } to { transform: rotate(-16deg) scale(1); opacity: .92; } }
+</style>
+"""
+
+# Last thing in <body>: the stamp, kept current with the page's own ?format=info.
+STAMP = """<div class="xo-stamp" id="xo-stamp" aria-hidden="true"><div><span></span><small></small></div></div>
+<script>
+(function () {
+  var fa = function () { var m = document.cookie.match(/(?:^|; )subLang=([^;]*)/); return !m || /^fa/.test(decodeURIComponent(m[1])); };
+  var T = {
+    fa: { exp: "منقضی شده", dep: "حجم تمام شده", off: "غیرفعال", expS: "زمان اشتراک به پایان رسیده",
+          bothS: "و حجم هم تمام شده", depS: "حجم اشتراک مصرف شده", offS: "این اشتراک غیرفعال شده" },
+    en: { exp: "EXPIRED", dep: "DATA USED UP", off: "DISABLED", expS: "the subscription has ended",
+          bothS: "and its data is used up", depS: "no data left", offS: "this subscription is disabled" }
+  };
+  function draw(d) {
+    if (!d) return;
+    var t = fa() ? T.fa : T.en;
+    var used = (Number(d.uploadByte) || 0) + (Number(d.downloadByte) || 0), total = Number(d.totalByte) || 0;
+    var exp = Number(d.expire) || 0;
+    var expired = exp > 0 && exp * 1000 <= Date.now(), depleted = total > 0 && used >= total, off = d.enabled === false;
+    var word = expired ? t.exp : depleted ? t.dep : off ? t.off : "";
+    var sub = expired && depleted ? t.bothS : expired ? t.expS : depleted ? t.depS : off ? t.offS : "";
+    var el = document.getElementById("xo-stamp");
+    el.querySelector("span").textContent = word;
+    el.querySelector("small").textContent = sub;
+    el.classList.toggle("show", !!word);
+  }
+  draw(window.__SUB_PAGE_DATA__);
+  var url = location.pathname + (location.search ? location.search + "&" : "?") + "format=info";
+  setInterval(function () {
+    if (document.hidden) return;
+    fetch(url, { cache: "no-store" }).then(function (r) { return r.ok ? r.json() : null; }).then(draw).catch(function () {});
+  }, 30000);
+})();
+</script>
+"""
+
+
+def die(msg):
+    sys.stderr.write("xui-sub-fa: %s\n" % msg)
+    sys.exit(1)
+
+
+def conf():
+    try:
+        with open(CONF) as f:
+            return dict(DEFAULTS, **json.load(f))
+    except (OSError, ValueError):
+        return dict(DEFAULTS)
+
+
+def save_conf(c):
+    with open(CONF, "w") as f:
+        json.dump(c, f, indent=2)
+
+
+def db():
+    if not os.path.isfile(DB):
+        die("no 3x-ui database at %s (set XUI_DB)" % DB)
+    return sqlite3.connect(DB)
+
+
+def setting(c, key, default=""):
+    r = c.execute("select value from settings where key=?", (key,)).fetchone()
+    return r[0] if r else default
+
+
+def put(c, key, value):
+    if c.execute("update settings set value=? where key=?", (value, key)).rowcount == 0:
+        c.execute("insert into settings (key, value) values (?, ?)", (key, value))
+    c.commit()
+
+
+def original():
+    """The panel's subscription page as built into this x-ui binary (Go embeds files as they are)."""
+    if not os.path.isfile(XUI):
+        die("no x-ui binary at %s (set XUI_BIN)" % XUI)
+    b = open(XUI, "rb").read()
+    if b"subThemeDir" not in b:
+        die("this 3x-ui has no \"Sub Theme Directory\" setting - update the panel first")
+    for m in re.finditer(rb"<!doctype html>", b, re.I):
+        end = b.find(b"</html>", m.start())
+        page = b[m.start():end + 7]
+        if end > 0 and len(page) < 50000 and b"/subpage-" in page:
+            return page.decode("utf-8")
+    die("the subscription page was not found in %s - this needs 3x-ui 3.x" % XUI)
+
+
+def asset(page):
+    m = re.search(r"/(subpage-[\w-]+\.js)", page or "")
+    return m.group(1) if m else ""
+
+
+def build(c, cf):
+    page = original()
+    base = "/" + setting(c, "subPath", "/sub/").strip("/") + "/"
+    base = "/" if base == "//" else base
+    if base != "/":                                           # what the panel does to its own page
+        page = page.replace('src="/assets/', 'src="%sassets/' % base).replace('href="/assets/', 'href="%sassets/' % base)
+    if "{{" in page or page.count("<head>") != 1 or page.count("</head>") != 1 or page.count("</body>") != 1:
+        die("the panel's page does not look as expected; nothing changed")
+    js_base = json.dumps(base)[1:-1].replace("<", "\\u003c")
+    page = page.replace("<head>", "<head>\n" + BOOT % ("true" if cf["always"] else "false"), 1)
+    page = page.replace("</head>", DATA % (js_base, "true" if cf["jalali"] else "false") + STYLE + "</head>", 1)
+    page = page.replace("</body>", STAMP.replace('class="xo-stamp"', 'class="xo-stamp"%s' % ("" if cf["stamp"] else " hidden style=\"display:none!important\"")) + "</body>", 1)
+    os.makedirs(DIR, exist_ok=True)
+    with open(DIR + "/index.html.new", "w", encoding="utf-8") as f:
+        f.write(page)
+    os.chmod(DIR + "/index.html.new", 0o644)
+    os.replace(DIR + "/index.html.new", DIR + "/index.html")
+    return asset(page)
+
+
+def probe(c):
+    """Fetch one real subscription as a browser would, from this server itself."""
+    if setting(c, "subEnable", "true") != "true":
+        return None, "subscriptions are off in the panel"
+    row = c.execute("select sub_id from clients where sub_id != '' limit 1").fetchone() if \
+        c.execute("select 1 from sqlite_master where name='clients'").fetchone() else None
+    if not row:                                               # older layout: clients inside the inbounds
+        for (s,) in c.execute("select settings from inbounds"):
+            try:
+                sid = next((x.get("subId") for x in json.loads(s).get("clients", []) if x.get("subId")), None)
+            except ValueError:
+                sid = None
+            if sid:
+                row = (sid,)
+                break
+    if not row:
+        return None, "no client has a subscription id to test with"
+    tls = bool(setting(c, "subCertFile") and setting(c, "subKeyFile"))
+    host = setting(c, "subListen") or "127.0.0.1"
+    host = "127.0.0.1" if host in ("0.0.0.0", "::") else ("[%s]" % host if ":" in host else host)
+    path = ("/" + setting(c, "subPath", "/sub/").strip("/") + "/").replace("//", "/")
+    url = "%s://%s:%s%s%s" % ("https" if tls else "http", host, setting(c, "subPort", "2096"), path, row[0])
+    ctx = ssl.create_default_context()
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE        # the certificate names the domain
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "text/html", "User-Agent": "xui-sub-fa"})
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
+            return r.read().decode("utf-8", "replace"), ""
+    except Exception as e:
+        return None, str(e)
+
+
+def ours(c):
+    cur = setting(c, "subThemeDir")
+    return bool(cur) and os.path.realpath(cur) == os.path.realpath(DIR)
+
+
+def path_unit(enable):
+    if os.path.exists("/etc/systemd/system/xui-sub-fa.path"):
+        subprocess.run(["systemctl", "enable" if enable else "disable", "--now", "xui-sub-fa.path"],
+                       capture_output=True)
+
+
+def status(as_json=False):
+    c = db()
+    body, err = probe(c)
+    try:
+        current = asset(open(DIR + "/index.html", encoding="utf-8").read())
+    except OSError:
+        current = ""
+    st = {"version": VERSION, "theme_dir": setting(c, "subThemeDir"), "on": ours(c),
+          "serving": "persian" if body and MARK in body else ("panel" if body else "unknown"),
+          "current": bool(current) and current == asset(original()), "options": conf(), "error": err}
+    if as_json:
+        print(json.dumps(st))
+        return 0
+    print("theme dir : %s" % (st["theme_dir"] or "(empty - the panel's own page)"))
+    print("serving   : %s%s" % (st["serving"], " (%s)" % err if err else ""))
+    if st["on"]:
+        o = st["options"]
+        print("options   : jalali=%s stamp=%s always=%s" % (o["jalali"], o["stamp"], o["always"]))
+        if not st["current"]:
+            print("outdated  : the panel was updated - run `xui-sub-fa refresh`")
+    return 0
+
+
+def on(args):
+    cf = conf()
+    for a in args:
+        if a == "--no-jalali":
+            cf["jalali"] = False
+        elif a == "--jalali":
+            cf["jalali"] = True
+        elif a == "--no-stamp":
+            cf["stamp"] = False
+        elif a == "--stamp":
+            cf["stamp"] = True
+        elif a == "--always":
+            cf["always"] = True
+        elif a == "--once":
+            cf["always"] = False
+        else:
+            die("unknown option: %s" % a)
+    c = db()
+    before = setting(c, "subThemeDir")
+    build(c, cf)
+    save_conf(cf)
+    put(c, "subThemeDir", DIR)
+    body, err = probe(c)
+    if body is not None and MARK not in body:
+        put(c, "subThemeDir", before)
+        die("the panel did not serve the template (see `journalctl -u x-ui | grep sub:`) - "
+            "setting put back to %r" % before)
+    path_unit(True)
+    print("Persian subscription page on%s" % (" (not verified: %s)" % err if body is None else ""))
+    return 0
+
+
+def refresh():
+    c = db()
+    if not ours(c):
+        print("off - nothing to refresh")
+        return 0
+    print("rebuilt for %s" % build(c, conf()))
+    return 0
+
+
+def off():
+    c = db()
+    if ours(c):
+        put(c, "subThemeDir", "")
+    path_unit(False)
+    print("the panel's own subscription page is back")
+    return 0
+
+
+def main(a):
+    if not a or a[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if a[0] in ("-v", "--version", "version"):
+        print(VERSION)
+        return 0
+    if os.geteuid() != 0:
+        die("run as root")
+    if a[0] == "on":
+        return on(a[1:])
+    cmds = {"status": lambda: status("--json" in a), "refresh": refresh, "off": off}
+    if a[0] not in cmds:
+        die("unknown command: %s (on | status | refresh | off)" % a[0])
+    return cmds[a[0]]()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
