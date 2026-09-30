@@ -37,6 +37,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/MaxTeller95/3x-ui-sub-fa/mai
 
 ```bash
 xui-sub-fa status          # کدام صفحه نمایش داده می‌شود و آیا با نسخه‌ی پنل جور است
+xui-sub-fa status --sub LINK   # امتحان با لینک اشتراک یک کاربر مشخص (یا فقط subId)
 xui-sub-fa on [گزینه‌ها]    # روشن کردن یا عوض کردن گزینه‌ها (--no-jalali --no-stamp --always و برعکس‌شان --jalali --stamp --once)
 xui-sub-fa refresh         # ساختن دوباره (بعد از آپدیت پنل خودکار انجام می‌شود)
 xui-sub-fa off             # برگشت به صفحه‌ی خود پنل

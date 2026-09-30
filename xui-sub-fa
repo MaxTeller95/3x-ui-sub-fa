@@ -6,7 +6,9 @@
         --no-stamp                no stamp on expired / used-up / disabled subscriptions
         --always                  Persian on every visit (default: once per browser, after which the
                                   page's own language button is respected)
-    xui-sub-fa status [--json]  which page the users see, and whether it matches the installed panel
+        --sub ID|LINK             test with this subscription (default: the first one in the panel)
+    xui-sub-fa status [--sub ID|LINK] [--json]
+                                which page the users see, and whether it matches the installed panel
     xui-sub-fa refresh          rebuild after a panel update (xui-sub-fa.path runs it by itself
                                 when the x-ui binary changes); does nothing while off
     xui-sub-fa off              back to the untouched page
@@ -24,9 +26,9 @@ The page's script and style file names change with every panel release, hence th
 update. `on` renders a real subscription through the panel afterwards and puts the old setting
 back if the template is not served. No restart: 3x-ui reads the setting on every request.
 """
-import json, os, re, sqlite3, ssl, subprocess, sys, urllib.request
+import json, os, re, sqlite3, ssl, subprocess, sys, urllib.error, urllib.request
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 XUI = os.environ.get("XUI_BIN", "/usr/local/x-ui/x-ui")
 DB = os.environ.get("XUI_DB", "/etc/x-ui/x-ui.db")
 DIR = "/usr/local/share/xui-sub-fa"
@@ -186,36 +188,52 @@ def build(c, cf):
     return asset(page)
 
 
-def probe(c):
-    """Fetch one real subscription as a browser would, from this server itself."""
-    if setting(c, "subEnable", "true") != "true":
-        return None, "subscriptions are off in the panel"
-    row = c.execute("select sub_id from clients where sub_id != '' limit 1").fetchone() if \
-        c.execute("select 1 from sqlite_master where name='clients'").fetchone() else None
-    if not row:                                               # older layout: clients inside the inbounds
+def sub_ids(c):
+    """Subscription ids the panel knows, wherever this version keeps them."""
+    found = []
+    tables = {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
+    for table in ("clients", "client_traffics"):
+        if table in tables:
+            cols = {r[1] for r in c.execute("pragma table_info(%s)" % table)}
+            for col in ("sub_id", "subId"):
+                if col in cols:
+                    found += [r[0] for r in c.execute("select %s from %s where coalesce(%s, '') != '' limit 5" % (col, table, col))]
+    if "inbounds" in tables:                                  # clients inside each inbound's settings
         for (s,) in c.execute("select settings from inbounds"):
             try:
-                sid = next((x.get("subId") for x in json.loads(s).get("clients", []) if x.get("subId")), None)
-            except ValueError:
-                sid = None
-            if sid:
-                row = (sid,)
-                break
-    if not row:
-        return None, "no client has a subscription id to test with"
+                found += [x.get("subId") for x in json.loads(s or "{}").get("clients", []) if x.get("subId")]
+            except (ValueError, AttributeError):
+                pass
+    return found
+
+
+def probe(c, sid=None):
+    """Fetch one real subscription as a browser would, from this server itself."""
+    if setting(c, "subEnable", "true") != "true":
+        return None, "subscriptions are off in the panel (Settings -> Subscription)"
+    if sid:
+        sid = sid.rstrip("/").split("?")[0].rsplit("/", 1)[-1]   # a whole link works too
+    else:
+        ids = sub_ids(c)
+        if not ids:
+            return None, ("no client has a subscription id yet - add one to a client, or open a "
+                          "subscription link in a browser, or pass --sub ID")
+        sid = ids[0]
     tls = bool(setting(c, "subCertFile") and setting(c, "subKeyFile"))
     host = setting(c, "subListen") or "127.0.0.1"
     host = "127.0.0.1" if host in ("0.0.0.0", "::") else ("[%s]" % host if ":" in host else host)
     path = ("/" + setting(c, "subPath", "/sub/").strip("/") + "/").replace("//", "/")
-    url = "%s://%s:%s%s%s" % ("https" if tls else "http", host, setting(c, "subPort", "2096"), path, row[0])
+    url = "%s://%s:%s%s%s" % ("https" if tls else "http", host, setting(c, "subPort", "2096"), path, sid)
     ctx = ssl.create_default_context()
     ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE        # the certificate names the domain
     try:
         req = urllib.request.Request(url, headers={"Accept": "text/html", "User-Agent": "xui-sub-fa"})
         with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
             return r.read().decode("utf-8", "replace"), ""
+    except urllib.error.HTTPError as e:
+        return None, "%s answered HTTP %s%s" % (url, e.code, " (unknown subscription id)" if e.code in (400, 404) else "")
     except Exception as e:
-        return None, str(e)
+        return None, "%s: %s" % (url, e)
 
 
 def ours(c):
@@ -229,9 +247,9 @@ def path_unit(enable):
                        capture_output=True)
 
 
-def status(as_json=False):
+def status(as_json=False, sid=None):
     c = db()
-    body, err = probe(c)
+    body, err = probe(c, sid)
     try:
         current = asset(open(DIR + "/index.html", encoding="utf-8").read())
     except OSError:
@@ -254,7 +272,10 @@ def status(as_json=False):
 
 def on(args):
     cf = conf()
+    sid = opt(args, "--sub")
     for a in args:
+        if a == sid or a == "--sub":
+            continue
         if a == "--no-jalali":
             cf["jalali"] = False
         elif a == "--jalali":
@@ -274,7 +295,7 @@ def on(args):
     build(c, cf)
     save_conf(cf)
     put(c, "subThemeDir", DIR)
-    body, err = probe(c)
+    body, err = probe(c, sid)
     if body is not None and MARK not in body:
         put(c, "subThemeDir", before)
         die("the panel did not serve the template (see `journalctl -u x-ui | grep sub:`) - "
@@ -302,6 +323,15 @@ def off():
     return 0
 
 
+def opt(args, name):
+    if name in args:
+        i = args.index(name)
+        if i + 1 >= len(args):
+            die("%s needs a value" % name)
+        return args[i + 1]
+    return None
+
+
 def main(a):
     if not a or a[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
@@ -313,7 +343,7 @@ def main(a):
         die("run as root")
     if a[0] == "on":
         return on(a[1:])
-    cmds = {"status": lambda: status("--json" in a), "refresh": refresh, "off": off}
+    cmds = {"status": lambda: status("--json" in a, opt(a, "--sub")), "refresh": refresh, "off": off}
     if a[0] not in cmds:
         die("unknown command: %s (on | status | refresh | off)" % a[0])
     return cmds[a[0]]()
